@@ -1,300 +1,225 @@
-import numpy as np
 import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
 import streamlit as st
+import plotly.graph_objects as go
 from streamlit_autorefresh import st_autorefresh
 
-# --- Page Config ---
-st.set_page_config(
-    page_title="Shopfloor OEE Real-Time Telemetry",
-    page_icon="⚙️",
-    layout="wide",
+# --- Page Config & Refresh ---
+st.set_page_config(page_title="Line Progress & Machine Capability", layout="wide")
+st_autorefresh(interval=30 * 1000, key="auto_refresh")  # Refresh every 30 seconds
+
+# --- Header ---
+st.title("OEE & Production Line Capability Dashboard")
+st.markdown(
+    "Total Output Benchmark: <span style='color:#38bdf8'>Station A6</span> | "
+    "Hourly Output: <span style='color:#fbbf24'>Current Hour UPH</span>", 
+    unsafe_allow_html=True
 )
 
-# Auto-refresh every 20 seconds
-st_autorefresh(interval=20 * 1000, key="oee_poll")
-
-# --- Google Sheet Data Source ---
-SHEET_ID = "12z1zgQCnC8qHg11rADMl88JccXmbvbccxsxhnh-Ihp8"
-GID = "1225255672"
-CSV_URL = (
-    f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv&gid={GID}"
-)
-
-
+# --- Data Fetching & Parsing Logic ---
 @st.cache_data(ttl=15)
-def load_oee_data(url: str) -> pd.DataFrame:
-  data = pd.read_csv(url)
+def get_master_production_data():
+    # Updated Google Sheet ID and GID
+    FILE_ID = "12z1zgQCnC8qHg11rADMl88JccXmbvbccxsxhnh-Ihp8"
+    GID = "1225255672"
+    CSV_URL = f"https://docs.google.com/spreadsheets/d/{FILE_ID}/export?format=csv&gid={GID}"
+    
+    try:
+        # Load raw data without headers first to mimic the row scanning logic
+        raw_df = pd.read_csv(CSV_URL, header=None, dtype=str)
+        
+        # 1. Locate header row (Mimic JS logic: look for 'station' or 'uph')
+        header_idx = 0
+        for i in range(min(10, len(raw_df))):
+            row_str = " ".join(raw_df.iloc[i].fillna("").astype(str).str.lower())
+            if "station" in row_str or ("uph" in row_str and "time" in row_str):
+                header_idx = i
+                break
+                
+        df = pd.read_csv(CSV_URL, header=header_idx)
+        lower_cols = [str(c).lower().replace(" ", "").replace("_", "") for c in df.columns]
+        
+        # 2. Locate Columns based on JS mapping rules
+        def find_col(keywords, default_idx):
+            for i, c in enumerate(lower_cols):
+                if any(k in c for k in keywords):
+                    return df.columns[i]
+            return df.columns[default_idx] if default_idx < len(df.columns) else None
 
-  # Datetime conversions
-  data["Timestamp"] = pd.to_datetime(data["Timestamp"], errors="coerce")
-  data["StartTime"] = pd.to_datetime(data["StartTime"], errors="coerce")
+        col_map = {
+            "station": find_col(["station", "stn", "line"], 2),
+            "output": find_col(["currenthouruph", "uph"], 26),
+            "throughput": find_col(["throughput"], 18),
+            "fail": find_col(["totalfail", "fail"], 20),
+            "date": find_col(["timestamp", "start", "date"], 0),
+            "avail": find_col(["avail"], 24),
+            "perf": find_col(["perf"], 23),
+            "qual": find_col(["qual"], 22),
+            "oee": find_col(["oee"], 25)
+        }
+        
+        # 3. Clean Types (Parse Numbers & Percentages)
+        for key in ["output", "throughput", "fail", "avail", "perf", "qual", "oee"]:
+            col_name = col_map[key]
+            if col_name and col_name in df.columns:
+                # Remove commas, convert to numeric
+                df[col_name] = pd.to_numeric(df[col_name].astype(str).str.replace(",", ""), errors="coerce").fillna(0)
+                
+        # Fix Percentages (if <= 1, multiply by 100)
+        for key in ["avail", "perf", "qual", "oee"]:
+            col_name = col_map[key]
+            if col_name and col_name in df.columns:
+                df[col_name] = df[col_name].apply(lambda x: x * 100 if 0 < x <= 1 else x)
+                
+        # Clean Dates
+        date_col = col_map["date"]
+        if date_col:
+            df[date_col] = pd.to_datetime(df[date_col], errors="coerce").dt.strftime("%Y-%m-%d")
+            df[date_col] = df[date_col].fillna("Unknown")
+            
+        df[col_map["station"]] = df[col_map["station"]].astype(str).str.upper().str.strip()
+        
+        return df, col_map, True, "Connected successfully"
+    except Exception as e:
+        return pd.DataFrame(), {}, False, str(e)
 
-  # Clean numeric columns
-  metric_cols = [
-      "Availability",
-      "Line Performance",
-      "Quality",
-      "Line OEE",
-      "Throughput",
-      "Total Pass",
-      "Total Fail",
-      "Current Hour UPH",
-      "Soft Jam",
-      "Hard Jam",
-  ]
-  for col in metric_cols:
-    if col in data.columns:
-      data[col] = pd.to_numeric(data[col], errors="coerce").fillna(0)
+df, cmap, success, msg = get_master_production_data()
 
-  return data.sort_values(by="Timestamp")
+if not success or df.empty:
+    st.error(f"Failed to connect or sheet is empty: {msg}")
+    st.stop()
 
+# Live Diagnostic Bar
+st.info(f"**Diagnostic Bar** — Rows Loaded: **{len(df)}** | Station Col: **{cmap['station']}** | Output Source: **{cmap['output']}**")
 
-# --- Helper for Duration to Minutes ---
-def duration_to_mins(series: pd.Series) -> pd.Series:
-  """Converts 'HH:MM:SS' strings into total minutes."""
+# --- Planning Parameters Form ---
+st.markdown("### Planning Parameters & Demand Targets")
+c1, c2, c3, c4 = st.columns(4)
+demand_qtr = c1.number_input("Quarterly Demand (Units)", value=30000.0, step=1000.0)
+days_wk = c2.number_input("Working Days / Week", value=5, min_value=1, max_value=7)
+hrs_day = c3.number_input("Operating Hours / Day", value=21, min_value=1, max_value=24)
+wks_qtr = c4.number_input("Weeks / Quarter", value=12, min_value=1, max_value=14)
 
-  def convert(val):
-    if pd.isna(val) or not isinstance(val, str):
-      return 0.0
-    parts = val.split(":")
-    if len(parts) == 3:
-      return (
-          float(parts[0]) * 60 + float(parts[1]) + float(parts[2]) / 60
-      )  # hours*60 + min + sec/60
-    return 0.0
+# Math Calculations
+total_working_days = wks_qtr * days_wk
+total_operating_hrs = total_working_days * hrs_day
+daily_demand_target = (demand_qtr / total_working_days) if total_working_days > 0 else 0
+req_uph = (demand_qtr / total_operating_hrs) if total_operating_hrs > 0 else 0
+req_takt = (3600 / req_uph) if req_uph > 0 else 0
 
-  return series.apply(convert)
+st.markdown(
+    f"**Required Daily Target:** <span style='color:#38bdf8; font-family:monospace;'>{int(daily_demand_target):,}</span> units/day | "
+    f"**Required UPH:** <span style='color:#fbbf24; font-family:monospace;'>{req_uph:.1f}</span> UPH | "
+    f"**Target Takt Time:** <span style='color:#34d399; font-family:monospace;'>{req_takt:.1f}</span> sec", 
+    unsafe_allow_html=True
+)
+st.divider()
 
+# --- Data Aggregation ---
+# 1. Base Aggregations
+unique_days = df[df[cmap["date"]] != "Unknown"][cmap["date"]].nunique()
+num_days = max(1, unique_days)
 
-try:
-  df = load_oee_data(CSV_URL)
+# 2. A6 Benchmark Calculations
+a6_df = df[df[cmap["station"]].str.contains("A6", na=False)]
+a6_total_out = a6_df[cmap["output"]].sum()
+a6_avg_daily = a6_total_out / max(1, a6_df[cmap["date"]].nunique())
+a6_attainment = (a6_avg_daily / daily_demand_target * 100) if daily_demand_target > 0 else 100
+a6_avail = a6_df[cmap["avail"]].replace(0, pd.NA).mean()
+a6_qual = a6_df[cmap["qual"]].replace(0, pd.NA).mean()
 
-  # --- Sidebar Controls ---
-  st.sidebar.header("🕹️ Station & Time Filters")
+# 3. Station Matrix Calculations
+st_agg = df.groupby(cmap["station"]).agg(
+    total_out=(cmap["output"], "sum"),
+    fail=(cmap["fail"], "sum"),
+    avail_avg=(cmap["avail"], lambda x: x[x>0].mean()),
+    perf_avg=(cmap["perf"], lambda x: x[x>0].mean()),
+    qual_avg=(cmap["qual"], lambda x: x[x>0].mean()),
+    oee_avg=(cmap["oee"], lambda x: x[x>0].mean())
+).reset_index()
 
-  stations = ["All Stations"] + sorted(df["StationID"].dropna().unique().tolist())
-  selected_station = st.sidebar.selectbox("Select Station ID", stations)
+st_agg["daily_avg"] = st_agg["total_out"] / num_days
+st_agg["variance"] = st_agg["daily_avg"] - daily_demand_target
+st_agg["attainment"] = (st_agg["daily_avg"] / daily_demand_target * 100).fillna(100)
 
-  # Filter by date range
-  min_date = df["Timestamp"].min().date()
-  max_date = df["Timestamp"].max().date()
-  date_range = st.sidebar.date_input("Filter Date Range", [min_date, max_date])
+bottleneck_station = st_agg.loc[st_agg["daily_avg"].idxmin(), cmap["station"]] if not st_agg.empty else "N/A"
 
-  # Filter Data
-  filtered_df = df.copy()
-  if selected_station != "All Stations":
-    filtered_df = filtered_df[filtered_df["StationID"] == selected_station]
+# --- KPI Summary Cards ---
+k1, k2, k3, k4, k5, k6 = st.columns(6)
+k1.metric("A6 Cumulative Output", f"{int(a6_total_out):,} u", "Sum of Col AA")
+k2.metric("A6 Avg Daily Output", f"{int(a6_avg_daily):,} u/day", f"{a6_df[cmap['date']].nunique()} active days")
+k3.metric("Daily Target Attainment", f"{a6_attainment:.1f}%", f"Target: {int(daily_demand_target):,} u/day")
+k4.metric("A6 Availability", f"{a6_avail:.1f}%" if pd.notna(a6_avail) else "N/A")
+k5.metric("A6 Quality Rate", f"{a6_qual:.1f}%" if pd.notna(a6_qual) else "N/A")
+k6.metric("🚨 Line Bottleneck", bottleneck_station, f"Lowest output station", delta_color="inverse")
 
-  if len(date_range) == 2:
-    start_d, end_d = date_range
-    filtered_df = filtered_df[
-        (filtered_df["Timestamp"].dt.date >= start_d)
-        & (filtered_df["Timestamp"].dt.date <= end_d)
-    ]
+# --- Charts ---
+c_left, c_right = st.columns(2)
 
-  # --- Header Section ---
-  st.title("🏭 Real-Time OEE Manufacturing Telemetry")
-  latest_record = filtered_df.iloc[-1] if not filtered_df.empty else None
+with c_left:
+    st.subheader("Station A6 Daily Hourly Output vs Target")
+    a6_daily = a6_df.groupby(cmap["date"])[cmap["output"]].sum().reset_index()
+    fig1 = go.Figure()
+    fig1.add_trace(go.Bar(x=a6_daily[cmap["date"]], y=a6_daily[cmap["output"]], name="A6 Output", marker_color="#38bdf8"))
+    fig1.add_trace(go.Scatter(x=a6_daily[cmap["date"]], y=[daily_demand_target]*len(a6_daily), name="Target", mode="lines", line=dict(color="#ef4444", dash="dash")))
+    fig1.update_layout(height=350, margin=dict(l=0, r=0, t=30, b=0), plot_bgcolor="rgba(0,0,0,0)")
+    st.plotly_chart(fig1, use_container_width=True)
 
-  if latest_record is not None:
-    st.caption(
-        f"Displaying **{selected_station}** | Last Reported Timestamp:"
-        f" **{latest_record['Timestamp']}** (Shift: {latest_record['ShiftName']})"
-    )
+with c_right:
+    st.subheader("Daily Output Comparison Across All Stations")
+    colors = ["#38bdf8" if "A6" in s else "#94a3b8" for s in st_agg[cmap["station"]]]
+    fig2 = go.Figure()
+    fig2.add_trace(go.Bar(x=st_agg[cmap["station"]], y=st_agg["daily_avg"], marker_color=colors, name="Avg Output"))
+    fig2.add_trace(go.Scatter(x=st_agg[cmap["station"]], y=[daily_demand_target]*len(st_agg), name="Target", mode="lines", line=dict(color="#ef4444", dash="dash")))
+    fig2.update_layout(height=350, margin=dict(l=0, r=0, t=30, b=0), plot_bgcolor="rgba(0,0,0,0)")
+    st.plotly_chart(fig2, use_container_width=True)
 
-  # --- Row 1: KPI Cards ---
-  avg_oee = filtered_df["Line OEE"].mean()
-  avg_avail = filtered_df["Availability"].mean()
-  avg_perf = filtered_df["Line Performance"].mean()
-  avg_qual = filtered_df["Quality"].mean()
+# --- Station Matrix Table ---
+st.subheader("Station Capability & OEE Matrix")
+st_matrix = st_agg.copy()
+st_matrix.columns = ["Station", "Total Col AA Output", "Total Fail", "Avail %", "Perf %", "Qual %", "OEE %", "Daily Avg", "Variance", "Attainment %"]
+st_matrix["Daily Target"] = int(daily_demand_target)
 
-  total_pass = int(filtered_df["Total Pass"].sum())
-  total_fail = int(filtered_df["Total Fail"].sum())
-  total_parts = total_pass + total_fail
+# Reorder columns to match HTML table
+st_matrix = st_matrix[["Station", "Total Col AA Output", "Daily Avg", "Daily Target", "Variance", "Attainment %", "Avail %", "Perf %", "Qual %", "OEE %"]]
 
-  c1, c2, c3, c4 = st.columns(4)
+st.dataframe(
+    st_matrix.style.format({
+        "Total Col AA Output": "{:,.0f}",
+        "Daily Avg": "{:,.0f}",
+        "Variance": "{:+,.0f}",
+        "Attainment %": "{:.1f}%",
+        "Avail %": "{:.1f}%",
+        "Perf %": "{:.1f}%",
+        "Qual %": "{:.1f}%",
+        "OEE %": "{:.1f}%"
+    }).map(lambda v: 'color: #ef4444' if v < 0 else 'color: #10b981', subset=["Variance"]),
+    use_container_width=True,
+    hide_index=True
+)
 
-  c1.metric(
-      label="Overall OEE",
-      value=f"{avg_oee:.1f}%",
-      delta=(
-          f"{avg_oee - 85.0:.1f}% vs Target"
-          if not np.isnan(avg_oee)
-          else "No Data"
-      ),
-  )
-  c2.metric(label="Availability", value=f"{avg_avail:.1f}%")
-  c3.metric(label="Performance", value=f"{avg_perf:.1f}%")
-  c4.metric(
-      label="Quality Rate",
-      value=f"{avg_qual:.1f}%",
-      delta=f"{total_fail} rejects",
-      delta_color="inverse",
-  )
+# --- Station A6 Daily Log Table ---
+st.subheader("Station A6 Daily Output Log")
+a6_log = a6_df.groupby(cmap["date"]).agg(
+    hours_logged=(cmap["output"], "count"),
+    a6_total_out=(cmap["output"], "sum"),
+    throughput=(cmap["throughput"], "sum"),
+    total_fail=(cmap["fail"], "sum")
+).reset_index()
 
-  st.divider()
+a6_log["Target"] = int(daily_demand_target)
+a6_log["Variance"] = a6_log["a6_total_out"] - daily_demand_target
+a6_log["Attainment %"] = (a6_log["a6_total_out"] / daily_demand_target * 100).fillna(100)
 
-  # --- Row 2: Gauges & Production Summary ---
-  col_gauge, col_prod = st.columns([1, 1])
+a6_log.columns = ["Date", "Hours Logged", "A6 Total Output", "Throughput", "Total Fail", "Target", "Variance", "Attainment %"]
 
-  with col_gauge:
-    st.subheader("OEE Primary Gauge")
-    fig_gauge = go.Figure(
-        go.Indicator(
-            mode="gauge+number",
-            value=avg_oee,
-            domain={"x": [0, 1], "y": [0, 1]},
-            title={"text": "Average OEE (%)", "font": {"size": 20}},
-            gauge={
-                "axis": {"range": [0, 100]},
-                "bar": {"color": "#1f77b4"},
-                "steps": [
-                    {"range": [0, 50], "color": "#ffb3b3"},  # Low
-                    {"range": [50, 75], "color": "#ffe6b3"},  # Medium
-                    {"range": [75, 100], "color": "#c6ecc6"},  # Good
-                ],
-                "threshold": {
-                  "line": {"color": "red", "width": 3},
-                  "thickness": 0.75,
-                  "value": 85,  # World-class benchmark
-              },
-            },
-        )
-    )
-    fig_gauge.update_layout(height=280, margin=dict(l=10, r=10, t=40, b=10))
-    st.plotly_chart(fig_gauge, use_container_width=True)
-
-  with col_prod:
-    st.subheader("Throughput & Defect Split")
-    prod_summary = pd.DataFrame(
-        {"Status": ["Passed Units", "Defects"], "Count": [total_pass, total_fail]}
-    )
-    fig_pie = px.pie(
-        prod_summary,
-        names="Status",
-        values="Count",
-        color="Status",
-        color_discrete_map={"Passed Units": "#2ca02c", "Defects": "#d62728"},
-        hole=0.45,
-    )
-    fig_pie.update_layout(height=280, margin=dict(l=10, r=10, t=30, b=10))
-    st.plotly_chart(fig_pie, use_container_width=True)
-
-  # --- Row 3: Hourly Telemetry Trends ---
-  st.subheader("📈 Hourly OEE & Machine Telemetry Trend")
-  trend_fig = go.Figure()
-  trend_fig.add_trace(
-      go.Scatter(
-          x=filtered_df["Timestamp"],
-          y=filtered_df["Line OEE"],
-          mode="lines+markers",
-          name="OEE (%)",
-          line=dict(color="#1f77b4", width=2),
-      )
-  )
-  trend_fig.add_trace(
-      go.Scatter(
-          x=filtered_df["Timestamp"],
-          y=filtered_df["Availability"],
-          mode="lines",
-          name="Availability (%)",
-          line=dict(color="#2ca02c", dash="dash"),
-      )
-  )
-  trend_fig.add_trace(
-      go.Scatter(
-          x=filtered_df["Timestamp"],
-          y=filtered_df["Line Performance"],
-          mode="lines",
-          name="Performance (%)",
-          line=dict(color="#ff7f0e", dash="dot"),
-      )
-  )
-  trend_fig.update_layout(
-      xaxis_title="Time",
-      yaxis_title="Percentage (%)",
-      hovermode="x unified",
-      height=380,
-      margin=dict(l=20, r=20, t=30, b=20),
-  )
-  st.plotly_chart(trend_fig, use_container_width=True)
-
-  # --- Row 4: Machine Loss Breakdown & Jam Counts ---
-  col_downtime, col_jam = st.columns([1, 1])
-
-  with col_downtime:
-    st.subheader("⏱️ Machine State Duration (Minutes)")
-    time_cols = [
-        "Productive Time",
-        "Standby Time",
-        "No Material Time",
-        "Unscheduled Down Time",
-        "Engineering Time",
-    ]
-    present_time_cols = [c for c in time_cols if c in filtered_df.columns]
-
-    if present_time_cols:
-      durations = {
-          c: duration_to_mins(filtered_df[c]).sum() for c in present_time_cols
-      }
-      downtime_df = pd.DataFrame(
-          list(durations.items()), columns=["State", "Total Minutes"]
-      )
-
-      fig_bars = px.bar(
-          downtime_df,
-          x="Total Minutes",
-          y="State",
-          orientation="h",
-          color="State",
-          text_auto=".1f",
-      )
-      fig_bars.update_layout(
-          showlegend=False, height=300, margin=dict(l=10, r=10, t=10, b=10)
-      )
-      st.plotly_chart(fig_bars, use_container_width=True)
-
-  with col_jam:
-    st.subheader("🚨 Mechanical Stoppages")
-    jam_sum = pd.DataFrame({
-        "Stoppage Type": ["Soft Jam", "Hard Jam"],
-        "Count": [
-            filtered_df["Soft Jam"].sum(),
-            filtered_df["Hard Jam"].sum(),
-        ],
-    })
-    fig_jams = px.bar(
-        jam_sum,
-        x="Stoppage Type",
-        y="Count",
-        color="Stoppage Type",
-        color_discrete_map={"Soft Jam": "#ffbb33", "Hard Jam": "#ff4444"},
-        text="Count",
-    )
-    fig_jams.update_layout(
-        showlegend=False, height=300, margin=dict(l=10, r=10, t=10, b=10)
-    )
-    st.plotly_chart(fig_jams, use_container_width=True)
-
-  # --- Row 5: Raw Feed Log ---
-  st.subheader("📋 Recent Shift Log Records")
-  display_cols = [
-      "Timestamp",
-      "ShiftName",
-      "StationID",
-      "Line OEE",
-      "Availability",
-      "Line Performance",
-      "Quality",
-      "Throughput",
-      "Total Pass",
-      "Total Fail",
-  ]
-  st.dataframe(
-      filtered_df[display_cols].tail(15).iloc[::-1], use_container_width=True
-  )
-
-except Exception as err:
-  st.error(f"Error loading or parsing OEE dashboard data: {err}")
+st.dataframe(
+    a6_log.style.format({
+        "A6 Total Output": "{:,.0f}",
+        "Throughput": "{:,.0f}",
+        "Total Fail": "{:,.0f}",
+        "Variance": "{:+,.0f}",
+        "Attainment %": "{:.1f}%"
+    }).map(lambda v: 'color: #ef4444' if v < 0 else 'color: #10b981', subset=["Variance"]),
+    use_container_width=True,
+    hide_index=True
+)
